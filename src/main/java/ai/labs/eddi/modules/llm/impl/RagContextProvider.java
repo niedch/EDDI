@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Discovers RAG configurations from the workflow, performs retrieval, and
@@ -52,8 +53,10 @@ public class RagContextProvider {
     private final IDataFactory dataFactory;
 
     @Inject
-    public RagContextProvider(IRestAgentStore restAgentStore, IRestWorkflowStore restWorkflowStore, IResourceClientLibrary resourceClientLibrary,
-            EmbeddingModelFactory embeddingModelFactory, EmbeddingStoreFactory embeddingStoreFactory, IDataFactory dataFactory) {
+    public RagContextProvider(IRestAgentStore restAgentStore, IRestWorkflowStore restWorkflowStore,
+            IResourceClientLibrary resourceClientLibrary,
+            EmbeddingModelFactory embeddingModelFactory, EmbeddingStoreFactory embeddingStoreFactory,
+            IDataFactory dataFactory) {
         this.restAgentStore = restAgentStore;
         this.restWorkflowStore = restWorkflowStore;
         this.resourceClientLibrary = resourceClientLibrary;
@@ -62,46 +65,24 @@ public class RagContextProvider {
         this.dataFactory = dataFactory;
     }
 
-    /**
-     * Result of a single KB retrieval — the KB name and the content chunk.
-     */
-    record RetrievalResult(String kbName, Content content) {
-    }
-
-    /**
-     * Discovers RAG configurations from the workflow and performs retrieval.
-     * Returns formatted context string for injection into LLM messages, or null if
-     * no RAG is configured/active for this task.
-     *
-     * @param memory
-     *            conversation memory (provides agentId/version)
-     * @param task
-     *            the LLM task configuration
-     * @param userQuery
-     *            the user's current input
-     * @return formatted context string, or null if no RAG retrieval
-     */
-    public String retrieveContext(IConversationMemory memory, LlmConfiguration.Task task, String userQuery) {
-
-        // Step 1: Determine which KBs to use
+    public Optional<String> retrieveContext(IConversationMemory memory, LlmConfiguration.Task task, String userQuery) {
         List<KnowledgeBaseReference> kbRefs = task.getKnowledgeBases();
         boolean hasExplicitRefs = kbRefs != null && !kbRefs.isEmpty();
         boolean useWorkflowDiscovery = !hasExplicitRefs && Boolean.TRUE.equals(task.getEnableWorkflowRag());
 
         if (!hasExplicitRefs && !useWorkflowDiscovery) {
-            return null; // No RAG for this task
+            return Optional.empty();
         }
 
-        // Step 2: Discover all RAG configs from workflow
-        var ragSteps = WorkflowTraversal.discoverConfigs(memory, RAG_TYPE, RagConfiguration.class, restAgentStore, restWorkflowStore,
+        var ragSteps = WorkflowTraversal.discoverConfigs(memory, RAG_TYPE, RagConfiguration.class, restAgentStore,
+                restWorkflowStore,
                 resourceClientLibrary);
 
         if (ragSteps.isEmpty()) {
             LOGGER.debug("No RAG steps found in workflow");
-            return null;
+            return Optional.empty();
         }
 
-        // Step 3: Match KBs by name (or use all if auto-discovery)
         List<RetrievalResult> allResults = new ArrayList<>();
         List<Map<String, Object>> traceEntries = new ArrayList<>();
         var currentStep = memory.getCurrentStep();
@@ -111,81 +92,109 @@ public class RagContextProvider {
             RagConfiguration ragConfig = step.config();
             String kbName = ragConfig.getName();
 
-            // Determine retrieval params
-            int maxResults;
-            double minScore;
-
-            if (useWorkflowDiscovery) {
-                // Use ragDefaults or KB defaults
-                RagDefaults defaults = task.getRagDefaults();
-                maxResults = defaults != null && defaults.getMaxResults() != null ? defaults.getMaxResults() : ragConfig.getMaxResults();
-                minScore = defaults != null && defaults.getMinScore() != null ? defaults.getMinScore() : ragConfig.getMinScore();
-            } else {
-                // Find matching reference (logically non-null here, but guard for null
-                // analysis)
-                if (kbRefs == null)
-                    continue;
-                var ref = kbRefs.stream().filter(r -> kbName.equals(r.getName())).findFirst().orElse(null);
-                if (ref == null)
-                    continue; // This KB not referenced by task
-
-                maxResults = ref.getMaxResults() != null ? ref.getMaxResults() : ragConfig.getMaxResults();
-                minScore = ref.getMinScore() != null ? ref.getMinScore() : ragConfig.getMinScore();
+            if (!shouldUseKb(kbRefs, kbName, useWorkflowDiscovery)) {
+                continue;
             }
 
-            try {
-                // Step 4: Build EmbeddingModel + EmbeddingStore + ContentRetriever
-                EmbeddingModel embeddingModel = embeddingModelFactory.getOrCreate(ragConfig);
-                EmbeddingStore<TextSegment> store = embeddingStoreFactory.getOrCreate(ragConfig, kbName);
-
-                ContentRetriever retriever = EmbeddingStoreContentRetriever.builder().embeddingStore(store).embeddingModel(embeddingModel)
-                        .maxResults(maxResults).minScore(minScore).build();
-
-                // Step 5: Retrieve
-                List<Content> relevant = retriever.retrieve(Query.from(userQuery));
-
-                LOGGER.infof("RAG retrieval from KB '%s': %d results (maxResults=%d, minScore=%.2f)", kbName, relevant.size(), maxResults, minScore);
-
-                // Build trace entry
-                Map<String, Object> traceEntry = new HashMap<>();
-                traceEntry.put("kb", kbName);
-                traceEntry.put("provider", ragConfig.getEmbeddingProvider());
-                traceEntry.put("storeType", ragConfig.getStoreType());
-                traceEntry.put("maxResults", maxResults);
-                traceEntry.put("minScore", minScore);
-                traceEntry.put("retrievedCount", relevant.size());
-                traceEntries.add(traceEntry);
-
-                allResults.addAll(relevant.stream().map(c -> new RetrievalResult(kbName, c)).toList());
-
-            } catch (Exception e) {
-                LOGGER.warnf(e, "Failed to retrieve from KB '%s': %s", kbName, e.getMessage());
-
-                Map<String, Object> errorTrace = new HashMap<>();
-                errorTrace.put("kb", kbName);
-                errorTrace.put("error", e.getMessage());
-                traceEntries.add(errorTrace);
-            }
+            resolveRetrievalParams(ragConfig, kbRefs, kbName, useWorkflowDiscovery, task)
+                    .ifPresent(params -> retrieveFromKb(ragConfig, kbName, params, userQuery, allResults, traceEntries));
         }
 
-        // Step 6: Store audit trace in memory
-        if (!traceEntries.isEmpty()) {
-            var ragTraceData = dataFactory.createData("rag:trace:" + taskId, traceEntries);
-            currentStep.storeData(ragTraceData);
-        }
+        storeTraceInMemory(currentStep, taskId, traceEntries);
 
         if (allResults.isEmpty()) {
-            return null;
+            return Optional.empty();
         }
 
-        // Step 7: Format context
         String formattedContext = formatRagContext(allResults);
-
-        // Store formatted context in memory for audit
         var ragContextData = dataFactory.createData("rag:context:" + taskId, formattedContext);
         currentStep.storeData(ragContextData);
 
-        return formattedContext;
+        return Optional.of(formattedContext);
+    }
+
+    private boolean shouldUseKb(List<KnowledgeBaseReference> kbRefs, String kbName, boolean useWorkflowDiscovery) {
+        return useWorkflowDiscovery || (kbRefs != null && kbRefs.stream().anyMatch(r -> kbName.equals(r.getName())));
+    }
+
+    private Optional<RetrievalParams> resolveRetrievalParams(RagConfiguration ragConfig, List<KnowledgeBaseReference> kbRefs,
+                                                             String kbName, boolean useWorkflowDiscovery,
+                                                             LlmConfiguration.Task task) {
+        if (useWorkflowDiscovery) {
+            RagDefaults defaults = task.getRagDefaults();
+            int maxResults = defaults != null && defaults.getMaxResults() != null
+                    ? defaults.getMaxResults()
+                    : ragConfig.getMaxResults();
+            double minScore = defaults != null && defaults.getMinScore() != null
+                    ? defaults.getMinScore()
+                    : ragConfig.getMinScore();
+            return Optional.of(new RetrievalParams(maxResults, minScore));
+        }
+
+        if (kbRefs == null) {
+            return Optional.empty();
+        }
+
+        return kbRefs.stream()
+                .filter(r -> kbName.equals(r.getName()))
+                .findFirst()
+                .map(ref -> new RetrievalParams(
+                        ref.getMaxResults() != null ? ref.getMaxResults() : ragConfig.getMaxResults(),
+                        ref.getMinScore() != null ? ref.getMinScore() : ragConfig.getMinScore()));
+    }
+
+    private void retrieveFromKb(RagConfiguration ragConfig, String kbName, RetrievalParams params,
+                                String userQuery, List<RetrievalResult> allResults,
+                                List<Map<String, Object>> traceEntries) {
+        try {
+            EmbeddingModel embeddingModel = embeddingModelFactory.getOrCreate(ragConfig);
+            EmbeddingStore<TextSegment> store = embeddingStoreFactory.getOrCreate(ragConfig, kbName);
+
+            ContentRetriever retriever = EmbeddingStoreContentRetriever.builder()
+                    .embeddingStore(store).embeddingModel(embeddingModel)
+                    .maxResults(params.maxResults()).minScore(params.minScore()).build();
+
+            List<Content> relevant = retriever.retrieve(Query.from(userQuery));
+
+            LOGGER.infof("RAG retrieval from KB '%s': %d results (maxResults=%d, minScore=%.2f)",
+                    kbName, relevant.size(), params.maxResults(), params.minScore());
+
+            traceEntries.add(buildSuccessTrace(ragConfig, kbName, params, relevant.size()));
+            allResults.addAll(relevant.stream().map(c -> new RetrievalResult(kbName, c)).toList());
+
+        } catch (Exception e) {
+            LOGGER.warnf(e, "Failed to retrieve from KB '%s': %s", kbName, e.getMessage());
+            traceEntries.add(buildErrorTrace(kbName, e));
+        }
+    }
+
+    private Map<String, Object> buildSuccessTrace(RagConfiguration ragConfig, String kbName,
+                                                  RetrievalParams params, int retrievedCount) {
+        Map<String, Object> trace = new HashMap<>();
+        trace.put("kb", kbName);
+        trace.put("provider", ragConfig.getEmbeddingProvider());
+        trace.put("storeType", ragConfig.getStoreType());
+        trace.put("maxResults", params.maxResults());
+        trace.put("minScore", params.minScore());
+        trace.put("retrievedCount", retrievedCount);
+        return trace;
+    }
+
+    private Map<String, Object> buildErrorTrace(String kbName, Exception e) {
+        Map<String, Object> trace = new HashMap<>();
+        trace.put("kb", kbName);
+        trace.put("error", e.getMessage());
+        return trace;
+    }
+
+    private void storeTraceInMemory(IConversationMemory.IWritableConversationStep currentStep,
+                                    String taskId, List<Map<String, Object>> traceEntries) {
+        if (traceEntries.isEmpty()) {
+            return;
+        }
+
+        var ragTraceData = dataFactory.createData("rag:trace:" + taskId, traceEntries);
+        currentStep.storeData(ragTraceData);
     }
 
     /**
@@ -210,4 +219,11 @@ public class RagContextProvider {
 
         return sb.toString().trim();
     }
+
+    record RetrievalResult(String kbName, Content content) {
+    }
+
+    record RetrievalParams(int maxResults, double minScore) {
+    }
+
 }

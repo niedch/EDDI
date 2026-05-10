@@ -234,10 +234,10 @@ public class LlmTask implements ILifecycleTask {
         // Vector store RAG: retrieve from knowledge bases in the workflow
         if (userInput != null) {
             try {
-                String ragContext = ragContextProvider.retrieveContext(memory, task, userInput);
-                if (ragContext != null) {
-                    systemMessage += "\n\n## Relevant Context:\n" + ragContext;
-                    LOGGER.infof("RAG context injected for task '%s': %d chars", taskId, ragContext.length());
+                Optional<String> ragContext = ragContextProvider.retrieveContext(memory, task, userInput);
+                if (ragContext.isPresent()) {
+                    systemMessage += "\n\n## Relevant Context:\n" + ragContext.get();
+                    LOGGER.infof("RAG context injected for task '%s': %d chars", taskId, ragContext.get().length());
                 }
             } catch (Exception e) {
                 LOGGER.warnf(e, "RAG context retrieval failed for task '%s': %s", taskId, e.getMessage());
