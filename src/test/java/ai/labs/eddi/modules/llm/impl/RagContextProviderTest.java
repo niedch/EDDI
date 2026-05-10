@@ -66,9 +66,9 @@ class RagContextProviderTest {
         task.setKnowledgeBases(null);
         task.setEnableWorkflowRag(false);
 
-        String result = ragContextProvider.retrieveContext(memory, task, "hello");
+        var result = ragContextProvider.retrieveContext(memory, task, "hello");
 
-        assertNull(result);
+        assertTrue(result.isEmpty());
         verify(restAgentStore, never()).readAgent(anyString(), anyInt());
     }
 
@@ -78,9 +78,9 @@ class RagContextProviderTest {
         task.setKnowledgeBases(List.of());
         task.setEnableWorkflowRag(false);
 
-        String result = ragContextProvider.retrieveContext(memory, task, "hello");
+        var result = ragContextProvider.retrieveContext(memory, task, "hello");
 
-        assertNull(result);
+        assertTrue(result.isEmpty());
     }
 
     @Test
@@ -90,9 +90,9 @@ class RagContextProviderTest {
 
         when(restAgentStore.readAgent("agent-123", 1)).thenReturn(null);
 
-        String result = ragContextProvider.retrieveContext(memory, task, "hello");
+        var result = ragContextProvider.retrieveContext(memory, task, "hello");
 
-        assertNull(result);
+        assertTrue(result.isEmpty());
     }
 
     @Test
@@ -106,9 +106,9 @@ class RagContextProviderTest {
 
         when(restAgentStore.readAgent("agent-123", 1)).thenReturn(null);
 
-        String result = ragContextProvider.retrieveContext(memory, task, "hello");
+        var result = ragContextProvider.retrieveContext(memory, task, "hello");
 
-        assertNull(result);
+        assertTrue(result.isEmpty());
         verify(restAgentStore).readAgent("agent-123", 1);
     }
 
